@@ -1,30 +1,88 @@
-// index.js
 /**
- * System Services Bot
- * - Auto setup on guild join (webhook, private category, channels, role assignment)
- * - Rich embeds + rich presence
- * - Awaiting Commands message
- * - Command handling with prefix '.' and role verification
- * - Render webhook receiver (POST /render-webhook) protected via RENDER_WEBHOOK_SECRET
+ * index.js — System Services (production ready)
  *
- * Environment variables required:
+ * Features:
+ *  - Auto-setup on guild join: webhook, private category, channels, role assignment
+ *  - Permission checks and detailed error handling
+ *  - Colorful embeds and formatted log blocks (===== ... =====)
+ *  - Rotating rich presence ("System Services: Online", etc.)
+ *  - Awaiting Commands message posted on startup & after setup
+ *  - Command handler with prefix '.' and role verification
+ *  - .help command with super-detailed Information section
+ *  - Render webhook endpoint with HMAC-SHA256 verification (header: x-render-signature)
+ *  - Optional persistence of guild channel IDs in data/guildSettings.json
+ *
+ * Environment variables (set in Render):
  *  - DISCORD_TOKEN
  *  - RENDER_WEBHOOK_SECRET
  *  - PORT (optional, default 3000)
  *
- * Dependencies: discord.js v14, express, dotenv
+ * Dependencies:
+ *  - discord.js (v14)
+ *  - express
+ *  - dotenv
+ *  - fs (node built-in)
+ *  - crypto (node built-in)
+ *
+ * Notes:
+ *  - Invite the bot with Manage Channels, Manage Roles, Manage Webhooks, Send Messages
+ *  - For HMAC verification: Render must provide the raw body signature in header 'x-render-signature'
+ *    which should equal HMAC_SHA256(rawBody, RENDER_WEBHOOK_SECRET). If Render uses a different header,
+ *    update VERIFY_HEADER variable accordingly.
  */
 
 require('dotenv').config();
-const express = require('express');
-const { Client, GatewayIntentBits, Partials, PermissionsBitField, ChannelType, EmbedBuilder } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
+const express = require('express');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  PermissionsBitField,
+  ChannelType,
+  EmbedBuilder,
+  Colors
+} = require('discord.js');
 
 const BOT_NAME = 'System Services';
 const PREFIX = '.';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
+const DATA_DIR = path.join(__dirname, 'data');
+const GUILD_SETTINGS_FILE = path.join(DATA_DIR, 'guildSettings.json');
+const PRESENCE_UPDATE_INTERVAL_MS = 20_000; // 20 seconds
+const VERIFY_HEADER = 'x-render-signature'; // header expected from Render; adjust if needed
 
-// Create the Discord client with required intents to read messages and guild info
+// create data directory if missing
+if (!fs.existsSync(DATA_DIR)) {
+  try {
+    fs.mkdirSync(DATA_DIR);
+  } catch (err) {
+    console.warn('Could not create data directory, persistence disabled:', err.message);
+  }
+}
+
+// load persistent guild settings (best-effort)
+let guildSettings = {};
+try {
+  if (fs.existsSync(GUILD_SETTINGS_FILE)) {
+    const raw = fs.readFileSync(GUILD_SETTINGS_FILE, 'utf8');
+    guildSettings = JSON.parse(raw);
+  }
+} catch (err) {
+  console.warn('Failed to load guild settings:', err.message);
+  guildSettings = {};
+}
+function persistGuildSettings() {
+  try {
+    fs.writeFileSync(GUILD_SETTINGS_FILE, JSON.stringify(guildSettings, null, 2), 'utf8');
+  } catch (err) {
+    console.warn('Failed to persist guild settings:', err.message);
+  }
+}
+
+// Discord client
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -32,426 +90,592 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent
   ],
-  partials: [Partials.Channel]
+  partials: [Partials.Channel, Partials.Message]
 });
 
-// Express app for Render webhooks
+// Express (we need raw body for HMAC verification)
 const app = express();
-app.use(express.json());
-const PORT = process.env.PORT || 3000;
-const RENDER_SECRET = process.env.RENDER_WEBHOOK_SECRET || null;
+
+// Raw body capture middleware for webhook verification
+app.use((req, res, next) => {
+  let data = [];
+  req.on('data', (chunk) => data.push(chunk));
+  req.on('end', () => {
+    req.rawBody = Buffer.concat(data);
+    try {
+      // try to parse JSON body into req.body (fallback)
+      if (req.rawBody && req.headers['content-type'] && req.headers['content-type'].includes('application/json')) {
+        req.body = JSON.parse(req.rawBody.toString('utf8'));
+      } else {
+        req.body = {};
+      }
+    } catch (err) {
+      req.body = {};
+    }
+    next();
+  });
+});
+
+// helpers
+function logConsoleBlock(title, lines) {
+  console.log('===== ' + title + ' =====');
+  lines.forEach(l => console.log(l));
+  console.log('=======================');
+}
 
 function formatBlock(title, lines) {
   return '```' + `===== ${title} =====\n` + lines.join('\n') + '\n=====`' + '```';
 }
 
-// Utility: create a colorful embed with details
-function makeDetailedEmbed({ title, description, color = 0x1ABC9C, fields = [], footerText = null, timestamp = true }) {
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(description || '\u200b')
-    .setColor(color);
-
-  for (const f of fields) {
-    embed.addFields([{ name: f.name || '\u200b', value: f.value || '\u200b', inline: !!f.inline }]);
+function makeEmbed({ title = '', description = '', color = 0x2ECC71, fields = [], footer = null }) {
+  const e = new EmbedBuilder().setTitle(title).setDescription(description).setColor(color).setTimestamp();
+  if (fields && fields.length) {
+    const safeFields = fields.map(f => ({ name: f.name || '\u200b', value: f.value || '\u200b', inline: !!f.inline }));
+    e.addFields(safeFields);
   }
-  if (footerText) embed.setFooter({ text: footerText });
-  if (timestamp) embed.setTimestamp();
-  return embed;
+  if (footer) e.setFooter({ text: footer });
+  return e;
 }
 
-// Helper: find a channel the bot can send to
-function findAnySendableChannel(guild) {
-  // prefer 'render-console-logs' if exists, otherwise choose first text channel bot can send in
-  const preferred = guild.channels.cache.find(c => c.name === 'render-console-logs' && c.type === ChannelType.GuildText);
-  if (preferred && preferred.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)) return preferred;
-
-  for (const ch of guild.channels.cache.values()) {
-    if (ch.type === ChannelType.GuildText && ch.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)) {
+function findSendableChannel(guild) {
+  // prefer stored channel IDs (render-console-logs), else any text channel bot can send to
+  const saved = guildSettings[guild.id]?.renderConsoleLogsChannelId;
+  if (saved) {
+    const ch = guild.channels.cache.get(saved);
+    if (ch && ch.type === ChannelType.GuildText && ch.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)) {
       return ch;
     }
+  }
+  const preferred = guild.channels.cache.find(c => c.name === 'render-console-logs' && c.type === ChannelType.GuildText && c.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages));
+  if (preferred) return preferred;
+  for (const ch of guild.channels.cache.values()) {
+    if (ch.type === ChannelType.GuildText && ch.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)) return ch;
   }
   return null;
 }
 
-// On ready: set rich presence and log
-client.once('ready', async () => {
+async function trySendLog(guild, title, lines) {
   try {
-    await client.user.setPresence({
-      activities: [{ name: 'System Services: Online', type: 3 }], // 3 = Watching
-      status: 'online'
-    });
+    const ch = findSendableChannel(guild);
+    if (!ch) return false;
+    await ch.send(formatBlock(title, lines));
+    return true;
   } catch (err) {
-    console.error('Failed to set presence:', err);
+    console.warn('Failed to send log block to guild', guild.id, err.message);
+    return false;
   }
-  console.log(`${BOT_NAME} v${VERSION} logged in as ${client.user.tag}`);
-  // Post "Awaiting Commands" to each guild in a channel the bot can send to
-  for (const guild of client.guilds.cache.values()) {
-    const channel = findAnySendableChannel(guild);
-    if (channel) {
-      try {
-        const embed = makeDetailedEmbed({
-          title: 'System Services • Status',
-          description: '**Awaiting Commands**\nThe bot is online and waiting for commands. Use `.help` for details.',
-          color: 0x0E5A8A,
-          fields: [
-            { name: 'Bot', value: `${BOT_NAME} (v${VERSION})`, inline: true },
-            { name: 'Status', value: 'Online', inline: true },
-            { name: 'Prefix', value: `\`${PREFIX}\``, inline: true }
-          ],
-          footerText: 'System Services'
-        });
-        await channel.send({ embeds: [embed] });
-      } catch (err) {
-        console.warn('Could not send Awaiting Commands to guild', guild.id, err);
-      }
-    }
-  }
-});
+}
 
-// When the bot joins a new guild
-client.on('guildCreate', async (guild) => {
-  console.log(`Joined guild: ${guild.name} (${guild.id})`);
-  const logLines = [
-    `Guild Name: ${guild.name}`,
-    `Guild ID: ${guild.id}`,
-    `Joining time: ${new Date().toISOString()}`
-  ];
+// presence rotation
+const presenceOptions = [
+  { name: 'System Services: Online', type: 3 }, // Watching
+  { name: 'Monitoring Render Deploys', type: 3 },
+  { name: 'Awaiting Commands', type: 3 },
+  { name: 'Managing System Services', type: 3 },
+];
 
+let presenceIndex = 0;
+function rotatePresence() {
   try {
-    // 1) Create a webhook named "System Services" in the system channel or first sendable text channel
-    let systemChannel = guild.systemChannel;
-    if (!systemChannel) {
-      systemChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.ManageWebhooks));
-    }
-    if (systemChannel) {
-      try {
-        await systemChannel.createWebhook({ name: 'System Services', reason: 'Auto-created webhook by System Services bot' });
-        logLines.push('Created webhook: System Services');
-      } catch (err) {
-        logLines.push(`Failed to create webhook in ${systemChannel.name}: ${err.message}`);
-      }
-    } else {
-      logLines.push('No suitable channel found to create webhook.');
-    }
+    const p = presenceOptions[presenceIndex % presenceOptions.length];
+    client.user.setPresence({ activities: [{ name: p.name, type: p.type }], status: 'online' }).catch(() => {});
+    presenceIndex++;
+  } catch (err) {
+    console.warn('Presence rotation failed:', err.message);
+  }
+}
 
-    // 2) Create private category "System Services Status"
-    const everyoneRole = guild.roles.everyone;
-    const category = await guild.channels.create({
+// robust setup function for a guild
+async function performAutoSetup(guild) {
+  const logLines = [];
+  logLines.push(`Guild Name: ${guild.name}`);
+  logLines.push(`Guild ID: ${guild.id}`);
+  logLines.push(`Timestamp: ${new Date().toISOString()}`);
+
+  // check essential permissions
+  const missingPerms = [];
+  const meMember = guild.members.me;
+  if (!meMember) {
+    logLines.push('Failed to get bot member info; aborting setup.');
+    await trySendLog(guild, 'LOGGING', logLines);
+    return;
+  }
+
+  const reqPerms = ['ManageChannels', 'ManageRoles', 'ManageWebhooks', 'SendMessages', 'ViewChannel'];
+  const botPerms = meMember.permissions;
+  for (const p of reqPerms) {
+    if (!botPerms.has(PermissionsBitField.Flags[p])) {
+      missingPerms.push(p);
+    }
+  }
+  if (missingPerms.length) {
+    logLines.push(`Warning: Bot may be missing required permissions: ${missingPerms.join(', ')}`);
+    await trySendLog(guild, 'LOGGING', logLines);
+    // proceed but note failures will occur
+  }
+
+  // 1) Create webhook in system channel or first channel we can manage webhooks in
+  let systemChannel = guild.systemChannel;
+  if (!systemChannel) {
+    systemChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.permissionsFor(meMember).has(PermissionsBitField.Flags.ManageWebhooks));
+  }
+  if (systemChannel) {
+    try {
+      await systemChannel.createWebhook({ name: 'System Services', reason: 'Auto-created webhook' });
+      logLines.push(`Created webhook "System Services" in channel ${systemChannel.name}`);
+    } catch (err) {
+      logLines.push(`Failed to create webhook in ${systemChannel.name}: ${err.message}`);
+    }
+  } else {
+    logLines.push('No suitable channel to create webhook.');
+  }
+
+  // 2) Create private category
+  const everyone = guild.roles.everyone;
+  let category;
+  try {
+    category = await guild.channels.create({
       name: 'System Services Status',
       type: ChannelType.GuildCategory,
       permissionOverwrites: [
-        {
-          id: everyoneRole.id,
-          deny: [PermissionsBitField.Flags.ViewChannel]
-        }
+        { id: everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+        { id: meMember.roles.highest.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.ManageChannels] }
       ],
       reason: 'Auto-created category for system services'
     });
     logLines.push('Created category: System Services Status');
+  } catch (err) {
+    logLines.push('Failed to create category: ' + err.message);
+  }
 
-    // 3) Create text channels in that category
-    const channelNames = [
-      'render-console-logs',
-      'render-errors',
-      'render-failed',
-      'render-status',
-      'bot-status'
-    ];
-    const createdChannels = {};
-    for (const name of channelNames) {
-      try {
-        const ch = await guild.channels.create({
-          name,
-          type: ChannelType.GuildText,
-          parent: category.id,
-          permissionOverwrites: [
-            {
-              id: everyoneRole.id,
-              deny: [PermissionsBitField.Flags.ViewChannel]
-            },
-            {
-              id: guild.members.me.roles.highest.id,
-              allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageMessages]
-            }
-          ],
-          reason: 'Auto-created system channel'
-        });
-        createdChannels[name] = ch;
-        logLines.push(`Created channel: ${name}`);
-      } catch (err) {
-        logLines.push(`Failed to create channel ${name}: ${err.message}`);
-      }
-    }
-
-    // 4) Create role "System Services Manager" with Administrator
-    const managerRole = await guild.roles.create({
-      name: 'System Services Manager',
-      color: '#000000',
-      permissions: [PermissionsBitField.Flags.Administrator],
-      reason: 'Role for system services management'
-    });
-    logLines.push('Created role: System Services Manager (Administrator)');
-
-    // 5) Assign role to the person who added the bot (audit logs)
+  // 3) Create channels
+  const channelsToCreate = [
+    { name: 'render-console-logs', purpose: 'Detailed formatted logs & startup output' },
+    { name: 'render-errors', purpose: 'Render errors & failure events' },
+    { name: 'render-failed', purpose: 'Failed deploys & critical alerts' },
+    { name: 'render-status', purpose: 'Deploy status & info' },
+    { name: 'bot-status', purpose: 'Bot health & awaiting commands messages' }
+  ];
+  const created = {};
+  for (const spec of channelsToCreate) {
     try {
-      const audit = await guild.fetchAuditLogs({ type: 28, limit: 1 }); // 28 = BOT_ADD
-      const entry = audit.entries.first();
-      if (entry && entry.executor) {
-        try {
-          const member = await guild.members.fetch(entry.executor.id);
-          if (member) {
-            await member.roles.add(managerRole);
-            logLines.push(`Assigned System Services Manager to ${member.user.tag}`);
-          } else {
-            logLines.push('Could not fetch member who added the bot.');
-          }
-        } catch (err) {
-          logLines.push(`Failed to assign role to adder: ${err.message}`);
-        }
-      } else {
-        logLines.push('No BOT_ADD entry found in audit logs; role not auto-assigned.');
-      }
+      const ch = await guild.channels.create({
+        name: spec.name,
+        type: ChannelType.GuildText,
+        parent: category ? category.id : undefined,
+        permissionOverwrites: [
+          { id: everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+          { id: meMember.roles.highest.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageMessages] }
+        ],
+        reason: 'Auto-created system channel'
+      });
+      created[spec.name] = ch;
+      logLines.push(`Created channel: ${spec.name} (${spec.purpose})`);
     } catch (err) {
-      logLines.push(`Failed to fetch audit logs: ${err.message}`);
+      logLines.push(`Failed to create channel ${spec.name}: ${err.message}`);
     }
+  }
 
-    // 6) Send formatted setup log into render-console-logs (if available)
-    const consoleChannel = createdChannels['render-console-logs'] || findAnySendableChannel(guild);
-    if (consoleChannel) {
+  // Persist console log channel id for future
+  if (created['render-console-logs']) {
+    guildSettings[guild.id] = guildSettings[guild.id] || {};
+    guildSettings[guild.id].renderConsoleLogsChannelId = created['render-console-logs'].id;
+    persistGuildSettings();
+  }
+
+  // 4) Create role with Administrator
+  let managerRole = guild.roles.cache.find(r => r.name === 'System Services Manager');
+  if (!managerRole) {
+    try {
+      managerRole = await guild.roles.create({
+        name: 'System Services Manager',
+        color: '#000000',
+        permissions: [PermissionsBitField.Flags.Administrator],
+        reason: 'System Services Manager role'
+      });
+      logLines.push('Created role: System Services Manager (Administrator)');
+    } catch (err) {
+      logLines.push('Failed to create manager role: ' + err.message);
+    }
+  } else {
+    logLines.push('Manager role already exists: ' + managerRole.id);
+  }
+
+  // 5) Attempt to assign role to who added the bot via audit logs
+  try {
+    const audit = await guild.fetchAuditLogs({ type: 28, limit: 1 }); // BOT_ADD
+    const entry = audit.entries.first();
+    if (entry?.executor) {
+      const executorId = entry.executor.id;
       try {
-        await consoleChannel.send(formatBlock('LOGGING', logLines));
+        const member = await guild.members.fetch(executorId);
+        if (member && managerRole) {
+          await member.roles.add(managerRole);
+          logLines.push(`Assigned role to ${member.user.tag}`);
+        } else {
+          logLines.push('Could not assign role — member or manager role missing.');
+        }
       } catch (err) {
-        console.warn('Failed to send setup log to render-console-logs:', err);
+        logLines.push(`Failed to assign role to adder (${executorId}): ${err.message}`);
       }
     } else {
-      console.warn('No channel available to send setup logs in guild', guild.id);
+      logLines.push('No BOT_ADD audit log entry found; could not auto-assign role.');
     }
+  } catch (err) {
+    logLines.push('Error fetching audit logs: ' + err.message);
+  }
 
-    // 7) Post "Awaiting Commands" to bot-status channel (if exists) or any sendable one
-    const statusChannel = createdChannels['bot-status'] || findAnySendableChannel(guild);
-    if (statusChannel) {
-      const awaitingEmbed = makeDetailedEmbed({
-        title: 'System Services • Bot Status',
-        description: '**Awaiting Commands**\nThe bot is online and awaiting commands. Use `.help` for available commands.',
-        color: 0x0E5A8A,
-        fields: [
-          { name: 'Bot', value: `${BOT_NAME} (v${VERSION})`, inline: true },
-          { name: 'Prefix', value: `\`${PREFIX}\``, inline: true },
-          { name: 'Manager Role', value: managerRole ? `<@&${managerRole.id}>` : 'Not available', inline: true }
-        ],
-        footerText: 'System Services'
-      });
-      try {
-        await statusChannel.send({ embeds: [awaitingEmbed] });
-      } catch (err) {
-        console.warn('Could not send Awaiting Commands embed:', err);
+  // Send setup embed + block to render-console-logs
+  const primaryLogChannel = created['render-console-logs'] || findSendableChannel(guild);
+  if (primaryLogChannel) {
+    const embed = makeEmbed({
+      title: 'System Services — Auto Setup Summary',
+      description: `Automatic setup completed for **${guild.name}**. See details below.`,
+      color: 0x0E5A8A,
+      fields: [
+        { name: 'Created Channels', value: channelsToCreate.map(c => `• ${c.name}`).join('\n') },
+        { name: 'Manager Role', value: managerRole ? `<@&${managerRole.id}>` : 'Not created', inline: true },
+        { name: 'Webhook', value: systemChannel ? `Attempted in ${systemChannel.name}` : 'No target channel' }
+      ],
+      footer: 'System Services'
+    });
+    try {
+      await primaryLogChannel.send({ embeds: [embed] });
+      await primaryLogChannel.send(formatBlock('LOGGING', logLines));
+    } catch (err) {
+      console.warn('Failed to post setup embed/block:', err.message);
+    }
+  } else {
+    logConsoleBlock('LOGGING', logLines);
+  }
+
+  // Post "Awaiting Commands" to bot-status
+  const statusTarget = created['bot-status'] || findSendableChannel(guild);
+  if (statusTarget) {
+    const awaitingEmbed = makeEmbed({
+      title: 'System Services • Bot Status',
+      description: '**Awaiting Commands**\nThe bot is online and ready. Use `.help` to view commands.',
+      color: 0x00BFFF,
+      fields: [
+        { name: 'Bot', value: `${BOT_NAME} (v${VERSION})`, inline: true },
+        { name: 'Prefix', value: `\`${PREFIX}\``, inline: true },
+        { name: 'Manager Role', value: managerRole ? `<@&${managerRole.id}>` : 'Not available', inline: true }
+      ],
+      footer: 'System Services'
+    });
+    try {
+      await statusTarget.send({ embeds: [awaitingEmbed] });
+    } catch (err) {
+      console.warn('Could not send Awaiting Commands embed:', err.message);
+    }
+  }
+
+  return { created, managerRole, category };
+}
+
+// send a short rich embed status when Render webhooks arrive
+async function dispatchRenderEventToGuild(guild, payload) {
+  try {
+    const statusChannel = guild.channels.cache.find(c => c.name === 'render-status' && c.type === ChannelType.GuildText);
+    const errorChannel = guild.channels.cache.find(c => c.name === 'render-errors' && c.type === ChannelType.GuildText);
+    const consoleChannel = guild.channels.cache.find(c => c.name === 'render-console-logs' && c.type === ChannelType.GuildText);
+
+    const eventType = payload.type || 'unknown';
+    const title = `Render Event • ${eventType}`;
+    const fields = [];
+    if (payload.data) {
+      if (payload.data.serviceName) fields.push({ name: 'Service', value: String(payload.data.serviceName), inline: true });
+      if (payload.data.serviceId) fields.push({ name: 'Service ID', value: String(payload.data.serviceId), inline: true });
+      if (payload.data.deployId) fields.push({ name: 'Deploy ID', value: String(payload.data.deployId), inline: true });
+    }
+    fields.push({ name: 'Timestamp', value: payload.timestamp || new Date().toISOString(), inline: true });
+
+    const isError = eventType.toLowerCase().includes('fail') || eventType.toLowerCase().includes('error') || eventType.toLowerCase().includes('crash');
+    const embed = makeEmbed({
+      title,
+      description: `Render sent event **${eventType}**. Summary below.`,
+      color: isError ? 0xE74C3C : 0x2ECC71,
+      fields
+    });
+
+    // attach payload snippet if small
+    try {
+      const shortJson = JSON.stringify(payload.data || payload, null, 2);
+      if (shortJson.length < 1500) {
+        embed.addFields([{ name: 'Payload (excerpt)', value: `\`\`\`json\n${shortJson}\n\`\`\`` }]);
+      } else {
+        embed.addFields([{ name: 'Payload', value: 'Payload too large to display. Check Render Dashboard.' }]);
       }
+    } catch (err) {
+      // ignore
     }
 
-    console.log(`Setup complete for guild ${guild.id}`);
-  } catch (error) {
-    console.error('Error during guildCreate setup:', error);
+    // send to appropriate channel(s)
+    if (isError) {
+      if (errorChannel) await errorChannel.send({ embeds: [embed] });
+      else if (statusChannel) await statusChannel.send({ embeds: [embed] });
+    } else {
+      if (statusChannel) await statusChannel.send({ embeds: [embed] });
+      else if (consoleChannel) await consoleChannel.send({ embeds: [embed] });
+    }
+
+    // also log to console channel
+    if (consoleChannel) {
+      await consoleChannel.send(formatBlock('RENDER WEBHOOK', [
+        `Event: ${eventType}`,
+        `Service ID: ${payload.data?.serviceId || 'N/A'}`,
+        `Timestamp: ${payload.timestamp || new Date().toISOString()}`
+      ]));
+    }
+
+    return true;
+  } catch (err) {
+    console.warn('Failed to dispatch render event to guild:', guild.id, err.message);
+    return false;
+  }
+}
+
+// On guild join: run setup
+client.on('guildCreate', async (guild) => {
+  try {
+    await performAutoSetup(guild);
+  } catch (err) {
+    console.error('guildCreate handler error:', err);
   }
 });
 
-// Command handling
+// On ready: presence rotation, post awaiting commands to each guild if possible
+client.once('ready', async () => {
+  console.log(`${BOT_NAME} v${VERSION} logged in as ${client.user.tag}`);
+  rotatePresence();
+  setInterval(rotatePresence, PRESENCE_UPDATE_INTERVAL_MS);
+
+  for (const guild of client.guilds.cache.values()) {
+    const channel = findSendableChannel(guild);
+    if (channel) {
+      try {
+        await channel.send({ embeds: [makeEmbed({
+          title: 'System Services • Startup',
+          description: '**Awaiting Commands**\nBot started and ready. Use `.help` for details.',
+          color: 0x0E5A8A,
+          fields: [
+            { name: 'Bot', value: `${BOT_NAME} (v${VERSION})`, inline: true },
+            { name: 'Prefix', value: `\`${PREFIX}\``, inline: true }
+          ],
+          footer: 'System Services'
+        })] });
+      } catch (err) {
+        // ignore
+      }
+    }
+  }
+});
+
+// Command handler with role check
 client.on('messageCreate', async (message) => {
-  if (!message.guild) return; // don't handle DMs
+  if (!message.guild) return; // ignore DMs
   if (message.author.bot) return;
   if (!message.content.startsWith(PREFIX)) return;
 
-  const [cmdName, ...args] = message.content.slice(PREFIX.length).trim().split(/\s+/);
-  const member = message.member;
-  const managerRole = message.guild.roles.cache.find(r => r.name === 'System Services Manager');
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd = args.shift().toLowerCase();
 
-  // Role check - require manager role
-  if (!managerRole || !member.roles.cache.has(managerRole.id)) {
-    // politely deny
-    try {
-      await message.reply({ embeds: [makeDetailedEmbed({
-        title: 'Access Denied',
-        description: 'You must have the **System Services Manager** role to use commands.',
-        color: 0xE74C3C,
-        fields: [{ name: 'Missing Role', value: 'System Services Manager' }],
-        footerText: 'Role verification failed'
-      })] });
-    } catch (err) { console.warn('Failed to send access denied reply:', err); }
-    return;
+  // Role verification
+  const managerRole = message.guild.roles.cache.find(r => r.name === 'System Services Manager');
+  if (!managerRole) {
+    // If role missing, tell user admin to re-run setup
+    return message.reply({ embeds: [makeEmbed({
+      title: 'Configuration Missing',
+      description: 'System Services Manager role is missing. Please ensure the bot has created it or run setup again.',
+      color: 0xFF8C00,
+      footer: 'System Services'
+    })] });
+  }
+  if (!message.member.roles.cache.has(managerRole.id)) {
+    return message.reply({ embeds: [makeEmbed({
+      title: 'Access Denied',
+      description: 'You must have the **System Services Manager** role to execute commands.',
+      color: 0xE74C3C,
+      fields: [{ name: 'Missing Role', value: 'System Services Manager' }],
+      footer: 'Role-based access control'
+    })] });
   }
 
-  // Commands
-  if (cmdName.toLowerCase() === 'help') {
-    // Detailed help embed
-    const uptimeMs = Date.now() - client.readyAt.getTime();
+  // commands
+  if (cmd === 'help') {
+    const uptimeMs = Date.now() - (client.readyAt ? client.readyAt.getTime() : Date.now());
     const uptimeSec = Math.floor(uptimeMs / 1000);
     const uptime = `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m ${uptimeSec % 60}s`;
 
-    const infoEmbed = makeDetailedEmbed({
+    const helpEmbed = makeEmbed({
       title: 'System Services — Help & Information',
-      description: 'A comprehensive command & information panel for System Services bot.',
-      color: 0x00BFFF,
+      description: 'Comprehensive control panel for the System Services bot. Commands require the **System Services Manager** role.',
+      color: 0x0099FF,
       fields: [
         { name: 'Prefix', value: `\`${PREFIX}\``, inline: true },
         { name: 'Version', value: VERSION, inline: true },
-        { name: 'Developer', value: 'You (configured in repository)', inline: true },
-        { name: 'Host', value: 'Render', inline: true },
         { name: 'Uptime', value: uptime, inline: true },
-        { name: 'Primary Role', value: 'System Services Manager (Administrator required)', inline: true },
         { name: '\u200b', value: '\u200b' },
-
-        { name: 'Commands', value:
-            '`help` — Shows this help panel\n' +
-            '`(Future)` — More commands will be added (e.g., restart, status, logs)'
+        { name: '**Commands**', value:
+            `\`${PREFIX}help\` — Show this help & information panel\n` +
+            `\`${PREFIX}info\` — Show detailed bot information (same as Information section)\n` +
+            `\`${PREFIX}setup\` — Re-run automatic setup (re-creates missing channels/role)\n` +
+            `\`${PREFIX}ping\` — Latency check\n` +
+            `\`${PREFIX}whoami\` — Shows your user & role info\n`
         },
         { name: 'Information (detailed)', value:
-            `**Bot Name:** ${BOT_NAME}\n` +
-            `**Purpose:** Auto-setup and monitoring of Render-hosted services via Discord.\n` +
-            `**Features:**\n` +
-            '- Auto-create webhook, private category & channels\n' +
-            '- Create and assign manager role\n' +
-            '- Receive and display Render webhook events\n' +
-            '- Rich presence and detailed embeds\n' +
-            '- Command system with role-based access control\n'
+            `**Name:** ${BOT_NAME}\n` +
+            `**Purpose:** Automate server setup for Render monitoring and forward Render webhook events into Discord.\n` +
+            `**Hosting:** Render — the bot listens for Render webhook POSTs at \`/render-webhook\`.\n` +
+            `**Permissions**: Manage Channels, Manage Roles, Manage Webhooks, Send Messages (required for setup).\n` +
+            `**Security**: Webhook verification via HMAC-SHA256 using RENDER_WEBHOOK_SECRET (header ${VERIFY_HEADER}).\n`
         },
-        { name: 'How to Use', value:
-            '• Invite the bot with Administrator permissions.\n' +
-            '• Ensure environment variables are set on Render: `DISCORD_TOKEN`, `RENDER_WEBHOOK_SECRET`, `PORT`.\n' +
-            '• Configure Render webhooks to point to `/render-webhook` with secret.\n' +
-            '• Use `.help` to view available commands.'
+        { name: 'Getting Started', value:
+            '• Invite the bot with Administrator or the listed permissions.\n' +
+            '• Add environment variables on Render: `DISCORD_TOKEN`, `RENDER_WEBHOOK_SECRET`, `PORT=3000`.\n' +
+            '• Create a Render webhook for your service → POST to:\n' +
+            `  \`https://<your-service>.onrender.com/render-webhook\` with header \`${VERIFY_HEADER}\` = your secret.\n`
+        },
+        { name: 'Notes & Limitations', value:
+            '- The bot posts summarized Render events. Full live streaming of service logs requires Render log streaming integrations.\n' +
+            '- Guild-specific settings are persisted in repository `data/guildSettings.json` (ephemeral on some hosts).'
         }
       ],
-      footerText: `Requested by ${message.author.tag}`
+      footer: 'System Services — Help'
     });
 
-    try {
-      await message.reply({ embeds: [infoEmbed] });
-    } catch (err) {
-      console.warn('Failed to send help embed:', err);
-    }
-    return;
+    return message.reply({ embeds: [helpEmbed] });
   }
 
-  // Unknown command
-  try {
-    await message.reply({ embeds: [makeDetailedEmbed({
-      title: 'Unknown Command',
-      description: `\`${cmdName}\` is not a recognized command.`,
-      color: 0xFF8C00,
-      fields: [{ name: 'Tip', value: `Use \`${PREFIX}help\` to see available commands.` }],
-      footerText: 'System Services'
+  if (cmd === 'info') {
+    // replicate main information panel
+    const info = makeEmbed({
+      title: 'System Services — Information',
+      description: `Detailed system information for **${BOT_NAME}**.`,
+      color: 0x00BFFF,
+      fields: [
+        { name: 'Bot Name', value: BOT_NAME, inline: true },
+        { name: 'Version', value: VERSION, inline: true },
+        { name: 'Host', value: 'Render', inline: true },
+        { name: 'Developer', value: 'You (configure repository)', inline: true },
+        { name: 'Prefix', value: `\`${PREFIX}\``, inline: true },
+        { name: 'Required Role', value: 'System Services Manager', inline: true },
+        { name: 'Uptime', value: client.readyAt ? `${Math.floor((Date.now() - client.readyAt.getTime())/1000)}s` : 'N/A', inline: true },
+      ],
+      footer: 'System Services'
+    });
+    return message.reply({ embeds: [info] });
+  }
+
+  if (cmd === 'ping') {
+    const sent = await message.reply({ content: 'Pinging...' });
+    const latency = sent.createdTimestamp - message.createdTimestamp;
+    return sent.edit({ embeds: [makeEmbed({
+      title: 'Pong!',
+      description: `Latency: \`${latency}ms\`\nAPI: \`${Math.round(client.ws.ping)}ms\``,
+      color: 0x2ECC71,
+      footer: 'System Services'
     })] });
-  } catch (err) { console.warn('Failed to send unknown command reply:', err); }
+  }
+
+  if (cmd === 'setup') {
+    // re-run setup
+    await message.reply({ embeds: [makeEmbed({ title: 'Setup', description: 'Re-running automatic setup. This may create missing channels/roles.', color: 0xF1C40F })] });
+    try {
+      await performAutoSetup(message.guild);
+      return message.reply({ embeds: [makeEmbed({ title: 'Setup Complete', description: 'Automatic setup finished. Check the render-console-logs for details.', color: 0x00BFFF })] });
+    } catch (err) {
+      return message.reply({ embeds: [makeEmbed({ title: 'Setup Error', description: `Error: ${err.message}`, color: 0xE74C3C })] });
+    }
+  }
+
+  if (cmd === 'whoami') {
+    const roles = message.member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).join(', ') || 'None';
+    return message.reply({ embeds: [makeEmbed({
+      title: 'User Info',
+      description: `${message.author.tag} (${message.author.id})`,
+      color: 0x3498DB,
+      fields: [
+        { name: 'Roles', value: roles },
+        { name: 'Joined Server', value: message.member.joinedAt ? message.member.joinedAt.toISOString() : 'N/A' }
+      ],
+      footer: 'System Services'
+    })] });
+  }
+
+  // unknown command
+  return message.reply({ embeds: [makeEmbed({
+    title: 'Unknown Command',
+    description: `Command \`${cmd}\` not found. Use \`${PREFIX}help\` to view commands.`,
+    color: 0xFF8C00
+  })] });
+
 });
 
-// Verify simple secret header for Render webhooks (HMAC optional) — here: compare header to env token
-function verifyRenderSecret(req) {
-  // Render commonly sends 'X-Render-Signature' or custom header; this implementation expects the secret in header 'x-render-signature'
-  const header = (req.headers['x-render-signature'] || req.headers['x-render-signature'] || '').toString();
-  if (!RENDER_SECRET) {
-    console.warn('No RENDER_WEBHOOK_SECRET configured; skipping verification.');
+// Verify Render webhook HMAC-SHA256 signature
+function verifyRenderWebhook(req) {
+  const secret = process.env.RENDER_WEBHOOK_SECRET;
+  if (!secret) {
+    console.warn('RENDER_WEBHOOK_SECRET not configured; skipping verification (insecure).');
     return true;
   }
-  if (!header) return false;
-  // Simple compare (in production use HMAC verification if available)
-  return header === RENDER_SECRET;
+  const headerSig = (req.headers[VERIFY_HEADER] || '').toString();
+  if (!headerSig) return false;
+
+  try {
+    // HMAC-SHA256
+    const hmac = crypto.createHmac('sha256', secret);
+    hmac.update(req.rawBody || Buffer.from(''));
+    const digest = hmac.digest('hex');
+    // constant-time compare
+    const headerNormalized = headerSig.startsWith('sha256=') ? headerSig.split('=')[1] : headerSig;
+    const a = Buffer.from(digest, 'utf8');
+    const b = Buffer.from(headerNormalized, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch (err) {
+    console.warn('Webhook verification failed:', err.message);
+    return false;
+  }
 }
 
 // Render webhook endpoint
 app.post('/render-webhook', async (req, res) => {
   try {
-    if (!verifyRenderSecret(req)) {
-      console.warn('Render webhook: invalid secret header');
-      return res.status(403).send('Invalid secret');
+    if (!verifyRenderWebhook(req)) {
+      logConsoleBlock('RENDER WEBHOOK', ['Invalid or missing signature header.']);
+      return res.status(403).send('Invalid signature');
     }
 
-    const payload = req.body;
-    console.log('Received Render webhook:', JSON.stringify(payload, null, 2));
+    const payload = req.body || {};
+    logConsoleBlock('RENDER WEBHOOK', [`Received render webhook: ${payload.type || 'unknown'}`, JSON.stringify(payload.data || payload).slice(0, 500)]);
 
-    // Determine target channels on each guild
+    // broadcast to all guilds where bot is present
     for (const guild of client.guilds.cache.values()) {
-      // prefer render-status for regular events, render-errors for failure ones, render-console-logs for verbose logs
-      const statusChannel = guild.channels.cache.find(c => c.name === 'render-status' && c.type === ChannelType.GuildText);
-      const errorChannel = guild.channels.cache.find(c => c.name === 'render-errors' && c.type === ChannelType.GuildText);
-      const consoleChannel = guild.channels.cache.find(c => c.name === 'render-console-logs' && c.type === ChannelType.GuildText);
-
-      // Build a rich embed for the Render event
-      const eventType = payload.type || 'unknown_event';
-      const title = `Render Event • ${eventType}`;
-      const fields = [];
-
-      // Top-level useful fields if present in payload.data
-      if (payload.data) {
-        if (payload.data.serviceId) fields.push({ name: 'Service ID', value: `${payload.data.serviceId}`, inline: true });
-        if (payload.data.serviceName) fields.push({ name: 'Service Name', value: `${payload.data.serviceName}`, inline: true });
-        if (payload.data.deployId) fields.push({ name: 'Deploy ID', value: `${payload.data.deployId}`, inline: true });
-        if (payload.data.region) fields.push({ name: 'Region', value: `${payload.data.region}`, inline: true });
-      }
-      fields.push({ name: 'Timestamp', value: payload.timestamp ? `${payload.timestamp}` : `${new Date().toISOString()}` });
-
-      const color = eventType.includes('failed') || eventType.includes('error') ? 0xE74C3C : 0x2ECC71;
-      const embed = makeDetailedEmbed({
-        title,
-        description: 'Detailed Render event payload (summary fields below). Full payload attached as JSON where applicable.',
-        color,
-        fields
-      });
-
-      // Attach abbreviated JSON (if not too large)
       try {
-        const shortJson = JSON.stringify(payload.data || payload, null, 2);
-        if (shortJson.length < 1800) {
-          embed.addFields([{ name: 'Payload', value: `\`\`\`json\n${shortJson}\n\`\`\`` }]);
-        } else {
-          // too big -> only include summary
-          embed.addFields([{ name: 'Payload', value: 'Payload too large to display here. Check Render Dashboard for full logs.' }]);
-        }
+        await dispatchRenderEventToGuild(guild, payload);
       } catch (err) {
-        // ignore
-      }
-
-      // Route messages: failures go to errorChannel, else statusChannel, and always write summary to consoleChannel if exists
-      try {
-        if (eventType.toLowerCase().includes('fail') || eventType.toLowerCase().includes('error')) {
-          if (errorChannel) await errorChannel.send({ embeds: [embed] });
-          else if (statusChannel) await statusChannel.send({ embeds: [embed] });
-        } else {
-          if (statusChannel) await statusChannel.send({ embeds: [embed] });
-          else if (consoleChannel) await consoleChannel.send({ embeds: [embed] });
-        }
-
-        // also write a plain formatted block to console channel for raw logging
-        if (consoleChannel) {
-          const lines = [
-            `Event: ${eventType}`,
-            `Service ID: ${payload.data?.serviceId || 'N/A'}`,
-            `Timestamp: ${payload.timestamp || (new Date().toISOString())}`
-          ];
-          await consoleChannel.send(formatBlock('RENDER WEBHOOK', lines));
-        }
-      } catch (err) {
-        console.warn('Failed to send render webhook embed to guild:', guild.id, err);
+        console.warn('Failed to dispatch event to guild', guild.id, err.message);
       }
     }
 
     return res.status(200).send('OK');
   } catch (err) {
-    console.error('Error handling render-webhook:', err);
+    console.error('Error in /render-webhook:', err);
     return res.status(500).send('Server error');
   }
 });
 
-// Start Express + Discord login
-app.listen(PORT, () => {
-  console.log(`${BOT_NAME} webhook listener running on port ${PORT}`);
-});
+// start express server & login bot
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`${BOT_NAME} webhook listener running on port ${PORT}`));
 
+// login
 if (!process.env.DISCORD_TOKEN) {
-  console.error('DISCORD_TOKEN missing from environment variables. Exiting.');
+  console.error('DISCORD_TOKEN not set in environment — exiting.');
   process.exit(1);
 }
-
 client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('Failed to login:', err);
+  console.error('Discord login failed:', err);
   process.exit(1);
 });
