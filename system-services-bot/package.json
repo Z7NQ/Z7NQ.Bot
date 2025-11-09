@@ -1,16 +1,14 @@
 {
   "name": "system-services-bot",
   "version": "1.0.0",
-  "description": "Discord bot integrated with Render for automated setup and logging.",
+  "description": "Discord bot with automatic server setup and Render webhook integration.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "author": "System",
-  "license": "MIT",
   "dependencies": {
     "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.1"
+    "express": "^4.21.1",
+    "dotenv": "^16.4.5"
   }
 }
