@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js"
   },
-  "author": "Your Name",
+  "author": "System",
   "license": "MIT",
   "dependencies": {
     "discord.js": "^14.16.3",
